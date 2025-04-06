@@ -6,8 +6,10 @@ import hashlib
 from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.PublicKey import RSA
 from Crypto.Hash import SHA256
+import time
+import hmac
 
-SERVER_IP = "127.0.0.1"
+SERVER_IP = "localhost"
 SERVER_PORT = 5555
 
 KEY_FILE = "client_rsa.pem"
@@ -93,3 +95,62 @@ enc_key, mac_key = derive_keys(master_secret)
 print(f"Derived Encryption Key: {enc_key.hex()}")
 print(f"Derived MAC Key: {mac_key.hex()}")
 
+#--------------------------------------------Transactions--------------------------------------------
+def compute_mac(key, message):
+    return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+
+while True:
+    print("\nChoose an action:")
+    print("1. Deposit")
+    print("2. Withdraw")
+    print("3. Balance Inquiry")
+    print("4. Exit")
+    choice = input("Enter your choice: ").strip()
+
+    if choice == "4":
+        print("Goodbye!")
+        break
+
+    if choice not in ["1", "2", "3"]:
+        print("Invalid choice.")
+        continue
+
+    action_map = {"1": "deposit", "2": "withdraw", "3": "balance"}
+    action = action_map[choice]
+    amount = ""
+
+    if action in ["deposit", "withdraw"]:
+        amount = input("Enter amount: ").strip()
+
+    transaction_data = json.dumps({
+        "action": action,
+        "amount": amount,
+        "timestamp": time.time(),
+        "client_id": client_id
+    })
+
+    encrypted_tx = encrypt_with_aes(enc_key, transaction_data)
+    mac = compute_mac(mac_key, encrypted_tx)
+
+    packet = json.dumps({
+        "type": "transaction",
+        "data": encrypted_tx,
+        "mac": mac
+    })
+    sock.send(packet.encode())
+
+    server_response = sock.recv(4096).decode()
+    try:
+        response_data = json.loads(server_response)
+        server_mac = response_data.get("mac")
+        encrypted_response = response_data.get("data")
+
+        if compute_mac(mac_key, encrypted_response) != server_mac:
+            print("Integrity check failed! Possible tampering.")
+            continue
+
+        decrypted_response = decrypt_with_aes(enc_key, encrypted_response)
+        print("Server Response:", decrypted_response)
+
+    except Exception as e:
+        print(f"Error: {e}")
