@@ -10,7 +10,22 @@ import time
 import hmac
 
 users = {}          
-accounts = {}       
+accounts = {} 
+nonce_list = []
+
+lock = threading.Lock()
+
+KEY_FILE = "shared_key"
+
+if os.path.exists(KEY_FILE):
+    with open(KEY_FILE, "rb") as f:
+        SHARED_KEY = base64.b64decode(f.read())
+else:
+    SHARED_KEY = os.urandom(32)
+    with open(KEY_FILE, "wb") as f:
+        # f.write(key.export_key())
+        f.write(base64.b64encode(SHARED_KEY))
+
 
 def compute_mac(key, message):
     return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
@@ -36,61 +51,78 @@ def handle_client(client_socket, addr):
     try:
         data = client_socket.recv(4096).decode()
         client_data = json.loads(data)
-        client_id = client_data["id"]
-        client_public_key = RSA.import_key(client_data["public_key"])
 
+        #Master secret key
         session_key = os.urandom(32)
         enc_key, mac_key = derive_keys(session_key)
+        isValidUser = False
 
-        cipher_rsa = PKCS1_OAEP.new(client_public_key)
-        encrypted_session_key = cipher_rsa.encrypt(session_key)
-        client_socket.send(base64.b64encode(encrypted_session_key))
+        if client_data.get("type") == "auth":
+            encrypted_auth = client_data["encrypted_data"]
+            # cipher_aes = AES.new(shared_key, AES.MODE_EAX, nonce=base64.b64decode(encrypted_auth)[:16])
+            # decrypted_auth = cipher_aes.decrypt(base64.b64decode(encrypted_auth)[16:]).decode()
+            decrypted_auth = decrypt_with_aes(SHARED_KEY, encrypted_auth)
+            action, username, password, client_nonce, client_id = decrypted_auth.split("|", 4)
 
-        while True:
+            with lock:  #Replay attack check
+                if client_nonce in nonce_list:
+                    print("Reused Nonce detected - Server can not authenticate client")
+
+                nonce_list.append(client_nonce)
+
+            response = {}
+            if action == 'R':
+                if username in users:
+                    response = {"status": "error", "message": "Username exists."}
+                else:
+                    salt = os.urandom(16)
+                    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+                    with lock:
+                        users[username] = (salt, hashed)    #save password
+                        accounts[username] = 0.0  # initialize account balance
+                    response = {"status": "success", "message": "Registered.", "nonce": client_nonce, "newKey": base64.b64encode(session_key).decode()}
+                    isValidUser = True
+            elif action == 'L':
+                if username not in users:
+                    response = {"status": "error", "message": "Username not found.", "nonce": client_nonce}
+                else:#Authenticate client via username/pass
+                    salt, stored_hash = users[username]
+                    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+                    if hashed == stored_hash:
+                        if username not in accounts:
+                            with lock:
+                                accounts[username] = 0.0
+                        response = {"status": "success", "message": "Logged in.", "nonce": client_nonce, "newKey": base64.b64encode(session_key).decode()}
+                        isValidUser = True
+                    else:
+                        response = {"status": "error", "message": "Invalid password.", "nonce": client_nonce}
+            else:
+                response = {"status": "error", "message": "Invalid action.", "nonce": client_nonce}
+
+            # cipher_aes = AES.new(SHARED_KEY, AES.MODE_EAX)
+            # nonce = cipher_aes.nonce
+            # ciphertext, tag = cipher_aes.encrypt_and_digest(json.dumps(response).encode())
+            # encrypted_response = base64.b64encode(nonce + ciphertext).decode()
+            encrypted_response = encrypt_with_aes(SHARED_KEY, json.dumps(response))
+            client_socket.send(json.dumps({"encrypted_response": encrypted_response}).encode())
+        else:
+            print("Starting auth message not recieved, ignoring client")
+
+        # client_id = client_data["id"]
+        # client_public_key = RSA.import_key(client_data["public_key"])
+
+        # cipher_rsa = PKCS1_OAEP.new(client_public_key)
+        # encrypted_session_key = cipher_rsa.encrypt(session_key)
+        # client_socket.send(base64.b64encode(encrypted_session_key))
+
+        while isValidUser:
             data = client_socket.recv(4096).decode()
             if not data:
                 break
 
             msg_data = json.loads(data)
 
-            if msg_data.get("type") == "auth":
-                encrypted_auth = msg_data["encrypted_data"]
-                cipher_aes = AES.new(session_key, AES.MODE_EAX, nonce=base64.b64decode(encrypted_auth)[:16])
-                decrypted_auth = cipher_aes.decrypt(base64.b64decode(encrypted_auth)[16:]).decode()
-                action, username, password = decrypted_auth.split("|", 2)
-
-                response = {}
-                if action == 'R':
-                    if username in users:
-                        response = {"status": "error", "message": "Username exists."}
-                    else:
-                        salt = os.urandom(16)
-                        hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-                        users[username] = (salt, hashed)
-                        accounts[client_id] = 0.0  # initialize account balance
-                        response = {"status": "success", "message": "Registered."}
-                elif action == 'L':
-                    if username not in users:
-                        response = {"status": "error", "message": "Username not found."}
-                    else:
-                        salt, stored_hash = users[username]
-                        hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-                        if hashed == stored_hash:
-                            if client_id not in accounts:
-                                accounts[client_id] = 0.0
-                            response = {"status": "success", "message": "Logged in."}
-                        else:
-                            response = {"status": "error", "message": "Invalid password."}
-                else:
-                    response = {"status": "error", "message": "Invalid action."}
-
-                cipher_aes = AES.new(session_key, AES.MODE_EAX)
-                nonce = cipher_aes.nonce
-                ciphertext, tag = cipher_aes.encrypt_and_digest(json.dumps(response).encode())
-                encrypted_response = base64.b64encode(nonce + ciphertext).decode()
-                client_socket.send(json.dumps({"encrypted_response": encrypted_response}).encode())
-
-            elif msg_data.get("type") == "transaction":
+            if msg_data.get("type") == "transaction":
                 mac = msg_data.get("mac")
                 encrypted_data = msg_data.get("data")
 
@@ -103,25 +135,28 @@ def handle_client(client_socket, addr):
                 action = tx_data["action"]
                 amount = float(tx_data["amount"]) if tx_data["amount"] else 0.0
 
-                if client_id not in accounts:
-                    accounts[client_id] = 0.0
+                if username not in accounts:
+                    with lock:
+                        accounts[username] = 0.0
 
                 if action == "deposit":
-                    accounts[client_id] += amount
-                    message = f"Deposited ${amount:.2f}. New balance: ${accounts[client_id]:.2f}"
+                    with lock:
+                        accounts[username] += amount
+                    message = f"Deposited ${amount:.2f}. New balance: ${accounts[username]:.2f}"
                 elif action == "withdraw":
-                    if accounts[client_id] >= amount:
-                        accounts[client_id] -= amount
-                        message = f"Withdrew ${amount:.2f}. New balance: ${accounts[client_id]:.2f}"
+                    if accounts[username] >= amount:
+                        with lock:
+                            accounts[username] -= amount
+                        message = f"Withdrew ${amount:.2f}. New balance: ${accounts[username]:.2f}"
                     else:
                         message = "Insufficient funds."
                 elif action == "balance":
-                    message = f"Current balance: ${accounts[client_id]:.2f}"
+                    message = f"Current balance: ${accounts[username]:.2f}"
                 else:
                     message = "Unknown action."
 
                 log_entry = {
-                    "client_id": client_id,
+                    "username": username,
                     "timestamp": time.time(),
                     "action": action
                 }
