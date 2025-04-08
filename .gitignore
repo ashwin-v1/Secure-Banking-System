@@ -1,4 +1,3 @@
 client_rsa.pem
 shared_key
 transaction_log.txt
-users_data.json
