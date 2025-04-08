@@ -14,9 +14,11 @@ accounts = {}            # username: {'balance': float, 'transactions': list}
 nonce_list = []          # Track used nonces for replay protection
 lock = threading.Lock()  # Thread synchronization
 
-# Shared key configuration
+# Configuration
 KEY_FILE = "shared_key"
+USERS_FILE = "users_data.json"
 
+# Load shared key
 if os.path.exists(KEY_FILE):
     with open(KEY_FILE, "rb") as f:
         SHARED_KEY = base64.b64decode(f.read())
@@ -25,18 +27,24 @@ else:
     with open(KEY_FILE, "wb") as f:
         f.write(base64.b64encode(SHARED_KEY))
 
+# Load users if they exist
+if os.path.exists(USERS_FILE):
+    with open(USERS_FILE, "r") as f:
+        raw_users = json.load(f)
+        for username, (salt_b64, hash_b64) in raw_users.items():
+            salt = base64.b64decode(salt_b64)
+            hash_val = base64.b64decode(hash_b64)
+            users[username] = (salt, hash_val)
+
 def compute_mac(key, message):
-    """Generate HMAC for message integrity verification"""
     return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
 
 def encrypt_with_aes(key, plaintext):
-    """Encrypt data using AES in EAX mode"""
     cipher = AES.new(key, AES.MODE_EAX)
     nonce = cipher.nonce
     ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode())
     result = base64.b64encode(nonce + ciphertext).decode()
 
-    # Outputs
     print(f"\n[ENCRYPTION]")
     print(f"Plaintext: {plaintext}")
     print(f"Nonce: {base64.b64encode(nonce).decode()}")
@@ -45,15 +53,12 @@ def encrypt_with_aes(key, plaintext):
 
     return result
 
-
 def decrypt_with_aes(key, enc_message):
-    """Decrypt data using AES in EAX mode"""
     raw = base64.b64decode(enc_message)
     nonce, ciphertext = raw[:16], raw[16:]
     cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
     plaintext = cipher.decrypt(ciphertext).decode()
 
-    # Outputs
     print(f"\n[DECRYPTION]")
     print(f"Base64 Input: {enc_message}")
     print(f"Nonce: {base64.b64encode(nonce).decode()}")
@@ -62,34 +67,48 @@ def decrypt_with_aes(key, enc_message):
 
     return plaintext
 
-
 def derive_keys(master_secret):
-    """Derive encryption and MAC keys from master secret"""
     enc_key = hashlib.sha256(master_secret + b'enc').digest()
     mac_key = hashlib.sha256(master_secret + b'mac').digest()
     return enc_key, mac_key
 
 def log_transaction(username, action, amount, status):
-    """Log transaction to file with timestamp and username"""
+    """Log transaction to plaintext and encrypted logs"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     log_entry = {
         "timestamp": timestamp,
-        "username": username, 
+        "username": username,
         "action": action,
         "amount": float(amount),
         "status": status
     }
+
+    # Plaintext log
     with open("transaction_log.txt", "a") as f:
         f.write(json.dumps(log_entry) + "\n")
 
+    # Encrypted log
+    encrypted_log = encrypt_with_aes(SHARED_KEY, json.dumps(log_entry))
+    with open("transaction_log_encrypted.txt", "a") as f:
+        f.write(encrypted_log + "\n")
+
+def save_users():
+    """Save user credentials (salt and hash) to disk"""
+    with open(USERS_FILE, "w") as f:
+        json.dump({
+            username: (
+                base64.b64encode(salt).decode(),
+                base64.b64encode(hashed).decode()
+            )
+            for username, (salt, hashed) in users.items()
+        }, f, indent=2)
+
 def handle_client_auth(client_socket, client_data):
-    """Handle client authentication (register/login)"""
     try:
         encrypted_auth = client_data["encrypted_data"]
         decrypted_auth = decrypt_with_aes(SHARED_KEY, encrypted_auth)
         action, username, password, client_nonce, client_id = decrypted_auth.split("|", 4)
 
-        # Replay attack protection
         with lock:
             if client_nonce in nonce_list:
                 raise ValueError("Reused nonce detected - possible replay attack")
@@ -104,11 +123,8 @@ def handle_client_auth(client_socket, client_data):
                 hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
                 with lock:
                     users[username] = (salt, hashed)
-                    # Initialize account with balance and transaction history
-                    accounts[username] = {
-                        'balance': 0.0,
-                        'transactions': []
-                    }
+                    accounts[username] = {'balance': 0.0, 'transactions': []}
+                    save_users()
                 response = {
                     "status": "success",
                     "message": "Registered successfully.",
@@ -124,11 +140,7 @@ def handle_client_auth(client_socket, client_data):
                 if hmac.compare_digest(hashed, stored_hash):
                     with lock:
                         if username not in accounts:
-                            # Initialize account if it doesn't exist
-                            accounts[username] = {
-                                'balance': 0.0,
-                                'transactions': []
-                            }
+                            accounts[username] = {'balance': 0.0, 'transactions': []}
                     response = {
                         "status": "success",
                         "message": "Logged in successfully.",
@@ -141,7 +153,6 @@ def handle_client_auth(client_socket, client_data):
         else:
             response = {"status": "error", "message": "Invalid action."}
 
-        # Always include the nonce in response for mutual authentication
         response["nonce"] = client_nonce
         encrypted_response = encrypt_with_aes(SHARED_KEY, json.dumps(response))
         return encrypted_response, response.get("newKey"), username if response.get("status") == "success" else None
@@ -153,22 +164,18 @@ def handle_client_auth(client_socket, client_data):
             "message": "Authentication failed",
             "nonce": client_nonce if 'client_nonce' in locals() else ""
         }
-        return encrypt_with_aes(SHARED_KEY, json.dumps(error_response)), None
+        return encrypt_with_aes(SHARED_KEY, json.dumps(error_response)), None, None
 
 def handle_client_transaction(client_socket, msg_data, username, enc_key, mac_key):
-    """Handle client transaction requests"""
     try:
-        # Verify MAC first
         if compute_mac(mac_key, msg_data["data"]) != msg_data["mac"]:
             raise ValueError("MAC verification failed")
 
-        # Decrypt transaction data
         decrypted_data = decrypt_with_aes(enc_key, msg_data["data"])
         tx_data = json.loads(decrypted_data)
         action = tx_data["action"]
         amount = float(tx_data["amount"]) if tx_data.get("amount") else 0.0
 
-        # Process transaction
         with lock:
             if username not in accounts:
                 accounts[username] = {'balance': 0.0, 'transactions': []}
@@ -179,7 +186,7 @@ def handle_client_transaction(client_socket, msg_data, username, enc_key, mac_ke
                 'amount': amount,
                 'timestamp': time.time(),
                 'status': 'pending',
-                'username': username  # Include username in the record
+                'username': username
             }
 
             if action == "deposit":
@@ -201,18 +208,10 @@ def handle_client_transaction(client_socket, msg_data, username, enc_key, mac_ke
                 transaction_record['status'] = 'failed'
                 message = "Unknown action."
 
-            # Record transaction
             account['transactions'].append(transaction_record)
 
-        # Log transaction - MAKE SURE USERNAME IS PASSED HERE
-        log_transaction(
-            username=username,  # This is the critical line that was missing
-            action=action,
-            amount=amount,
-            status=transaction_record['status']
-        )
+        log_transaction(username, action, amount, transaction_record['status'])
 
-        # Prepare response
         response = {
             "status": transaction_record['status'],
             "message": message,
@@ -227,13 +226,7 @@ def handle_client_transaction(client_socket, msg_data, username, enc_key, mac_ke
 
     except Exception as e:
         print(f"Transaction error: {e}")
-        # Log failed transaction with username if available
-        log_transaction(
-            username=username if 'username' in locals() else "unknown",
-            action=action if 'action' in locals() else "unknown",
-            amount=amount if 'amount' in locals() else 0.0,
-            status="error"
-        )
+        log_transaction(username or "unknown", action if 'action' in locals() else "unknown", amount if 'amount' in locals() else 0.0, "error")
         error_response = encrypt_with_aes(enc_key, json.dumps({
             "status": "error",
             "message": str(e)
@@ -244,7 +237,6 @@ def handle_client_transaction(client_socket, msg_data, username, enc_key, mac_ke
         }).encode())
 
 def handle_client(client_socket, addr):
-    """Main client handling function"""
     try:
         print(f"New connection from {addr}")
         data = client_socket.recv(4096).decode()
@@ -255,31 +247,22 @@ def handle_client(client_socket, addr):
         session_key = None
         enc_key, mac_key = None, None
 
-        # Initial authentication
         if client_data.get("type") == "auth":
             encrypted_response, session_key_b64, username = handle_client_auth(client_socket, client_data)
             client_socket.send(json.dumps({"encrypted_response": encrypted_response}).encode())
-            
+
             if session_key_b64:
                 session_key = base64.b64decode(session_key_b64)
                 enc_key, mac_key = derive_keys(session_key)
 
-        # Process subsequent transactions if authenticated
         if session_key:
             while True:
                 data = client_socket.recv(4096).decode()
                 if not data:
                     break
-
                 msg_data = json.loads(data)
                 if msg_data.get("type") == "transaction":
-                    handle_client_transaction(
-                        client_socket, 
-                        msg_data, 
-                        username, 
-                        enc_key, 
-                        mac_key
-                    )
+                    handle_client_transaction(client_socket, msg_data, username, enc_key, mac_key)
 
     except Exception as e:
         print(f"Client handling error: {e}")
@@ -288,8 +271,8 @@ def handle_client(client_socket, addr):
         print(f"Connection closed with {addr}")
 
 def start_server():
-    """Start the server and listen for connections"""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", 5555))
     server.listen(5)
     print("Bank Server started on port 5555")
@@ -297,11 +280,7 @@ def start_server():
     try:
         while True:
             client_socket, addr = server.accept()
-            threading.Thread(
-                target=handle_client,
-                args=(client_socket, addr),
-                daemon=True
-            ).start()
+            threading.Thread(target=handle_client, args=(client_socket, addr), daemon=True).start()
     except KeyboardInterrupt:
         print("\nServer shutting down...")
     finally:
